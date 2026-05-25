@@ -1,0 +1,183 @@
+import os
+import threading
+import queue
+from pathlib import Path
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+import fitz  # PyMuPDF
+from PIL import Image, ImageOps
+
+class PDFProcessor:
+    """Handles the core PDF processing logic independently of the GUI."""
+    
+    @staticmethod
+    def find_drawing_margins(page, zoom=2):
+        # Render page to high-resolution pixels
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        
+        # Convert to grayscale and threshold to handle off-white background noise safely
+        gray_img = img.convert("L")
+        # Threshold: anything above 250 becomes pure white (255)
+        thresh_img = gray_img.point(lambda p: 255 if p > 250 else p)
+        
+        # Invert colors (white background becomes black) to find the bounding box
+        invert_img = ImageOps.invert(thresh_img)
+        bbox = invert_img.getbbox()
+        
+        if bbox:
+            return fitz.Rect(bbox[0]/zoom, bbox[1]/zoom, bbox[2]/zoom, bbox[3]/zoom)
+        return None
+
+
+class PDFCropSelector:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Automatic PDF Border Cropper")
+        self.root.geometry("550x280")
+        self.root.resizable(False, False)
+
+        self.input_path = tk.StringVar()
+        self.output_path = tk.StringVar()
+        
+        # Queue for thread-safe communication
+        self.gui_queue = queue.Queue()
+
+        # --- GUI LAYOUT ---
+        # Input Section
+        lbl_in = tk.Label(root, text="Input Folder (Original PDFs):", font=("Arial", 10, "bold"))
+        lbl_in.pack(anchor="w", padx=20, pady=(15, 2))
+        frame_in = tk.Frame(root)
+        frame_in.pack(fill="x", padx=20)
+        self.entry_in = tk.Entry(frame_in, textvariable=self.input_path, width=50)
+        self.entry_in.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        btn_in = tk.Button(frame_in, text="Browse...", command=self.select_input)
+        btn_in.pack(side="right")
+
+        # Output Section
+        lbl_out = tk.Label(root, text="Output Folder (Cropped PDFs):", font=("Arial", 10, "bold"))
+        lbl_out.pack(anchor="w", padx=20, pady=(15, 2))
+        frame_out = tk.Frame(root)
+        frame_out.pack(fill="x", padx=20)
+        self.entry_out = tk.Entry(frame_out, textvariable=self.output_path, width=50)
+        self.entry_out.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        btn_out = tk.Button(frame_out, text="Browse...", command=self.select_output)
+        btn_out.pack(side="right")
+
+        # Start Button
+        self.btn_start = tk.Button(root, text="START PROCESSING", font=("Arial", 11, "bold"), bg="#4CAF50", fg="white", padx=10, pady=5, command=self.start_thread)
+        self.btn_start.pack(pady=20)
+
+        # Status Label and Progress Bar
+        self.lbl_status = tk.Label(root, text="Ready", font=("Arial", 9, "italic"))
+        self.lbl_status.pack(anchor="w", padx=20)
+        
+        self.progress_bar = ttk.Progressbar(root, orient="horizontal", length=510, mode="determinate")
+        self.progress_bar.pack(padx=20, pady=(2, 15))
+
+        # Start monitoring the queue loop
+        self.process_queue()
+
+    def select_input(self):
+        folder = filedialog.askdirectory(title="Select INPUT Folder")
+        if folder:
+            self.input_path.set(folder)
+
+    def select_output(self):
+        folder = filedialog.askdirectory(title="Select OUTPUT Folder")
+        if folder:
+            self.output_path.set(folder)
+
+    def start_thread(self):
+        c_input = self.input_path.get()
+        c_output = self.output_path.get()
+
+        if not c_input or not c_output:
+            messagebox.showerror("Error", "Please select both input and output folders!")
+            return
+        if Path(c_input).resolve() == Path(c_output).resolve():
+            messagebox.showerror("Error", "Output folder must be different from the input folder!")
+            return
+
+        self.btn_start.config(state="disabled")
+        threading.Thread(target=self.process_pdfs, args=(c_input, c_output), daemon=True).start()
+
+    def process_pdfs(self, input_dir, output_dir):
+        """Runs in background thread. Communicates via self.gui_queue."""
+        input_path = Path(input_dir)
+        output_path = Path(output_dir)
+        
+        pdf_files = list(input_path.glob("*.pdf"))
+        total_files = len(pdf_files)
+
+        if total_files == 0:
+            self.gui_queue.put(("warning", ("Warning", "No PDF files found in the input folder.")))
+            return
+
+        # Setup progress bar maximum
+        self.gui_queue.put(("setup_progress", total_files))
+        success_count = 0
+
+        for i, pdf_file in enumerate(pdf_files):
+            # Safe cross-thread GUI update command
+            self.gui_queue.put(("update_status", f"Processing: {pdf_file.name} ({i+1}/{total_files})"))
+            
+            try:
+                doc = fitz.open(pdf_file)
+                for page in doc:
+                    new_box = PDFProcessor.find_drawing_margins(page, zoom=2)
+                    if new_box:
+                        page.set_cropbox(new_box)
+                
+                # Check for filename collisions and save safely
+                target_file = output_path / pdf_file.name
+                if target_file.exists():
+                    target_file = output_path / f"cropped_{pdf_file.name}"
+                
+                doc.save(target_file, garbage=3, deflate=True)
+                doc.close()
+                success_count += 1
+            except Exception as e:
+                print(f"Error encountered on file {pdf_file.name}: {e}")
+
+            # Update progress bar safely
+            self.gui_queue.put(("progress", i + 1))
+
+        # Signal completion
+        self.gui_queue.put(("complete", (success_count, total_files)))
+
+    def process_queue(self):
+        """Runs continuously on the MAIN thread to safely digest GUI updates."""
+        try:
+            while True:
+                msg_type, data = self.gui_queue.get_nowait()
+                
+                if msg_type == "setup_progress":
+                    self.progress_bar["maximum"] = data
+                    self.progress_bar["value"] = 0
+                elif msg_type == "update_status":
+                    self.lbl_status.config(text=data)
+                elif msg_type == "progress":
+                    self.progress_bar["value"] = data
+                elif msg_type == "warning":
+                    self.btn_start.config(state="normal")
+                    messagebox.showwarning(data[0], data[1])
+                elif msg_type == "complete":
+                    success, total = data
+                    self.btn_start.config(state="normal")
+                    self.lbl_status.config(text="Processing completed!")
+                    messagebox.showinfo("Completed", f"Process finished!\nFiles successfully saved: {success}/{total}")
+                
+                self.gui_queue.task_done()
+        except queue.Empty:
+            pass
+        finally:
+            # Check the queue again in 100 milliseconds
+            self.root.after(100, self.process_queue)
+
+
+if __name__ == "__main__":
+    window = tk.Tk()
+    app = PDFCropSelector(window)
+    window.mainloop()
