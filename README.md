@@ -1,4 +1,4 @@
-# 📐 tips4architects
+#  tips4architects
 
 Welcome to **tips4architects**! This repository is a curated collection of open-source automation scripts, tools, and workflows engineered specifically to optimize the digital toolkit of architects, designers, and construction professionals.
 
@@ -6,7 +6,7 @@ In the modern design workflow, drafting and modeling are only half the battle—
 
 ---
 
-## 🛠️ Built With
+##  Built With
 
 The tools in this ecosystem leverage modern, fast, and accessible technologies:
 * **Python:** For cross-platform stability and ease of execution.
@@ -15,7 +15,7 @@ The tools in this ecosystem leverage modern, fast, and accessible technologies:
 
 ---
 
-## 🤝 Contributing & Ideas
+##  Contributing & Ideas
 
 Are you an architect with a workflow bottleneck, or a developer looking to help the design community? Feel free to open an issue to suggest a script idea, report a bug, or submit a pull request! 
 
