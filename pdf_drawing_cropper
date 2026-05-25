@@ -12,17 +12,13 @@ class PDFProcessor:
     
     @staticmethod
     def find_drawing_margins(page, zoom=2):
-        # Render page to high-resolution pixels
         mat = fitz.Matrix(zoom, zoom)
         pix = page.get_pixmap(matrix=mat)
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         
-        # Convert to grayscale and threshold to handle off-white background noise safely
         gray_img = img.convert("L")
-        # Threshold: anything above 250 becomes pure white (255)
         thresh_img = gray_img.point(lambda p: 255 if p > 250 else p)
         
-        # Invert colors (white background becomes black) to find the bounding box
         invert_img = ImageOps.invert(thresh_img)
         bbox = invert_img.getbbox()
         
@@ -35,27 +31,59 @@ class PDFCropSelector:
     def __init__(self, root):
         self.root = root
         self.root.title("Automatic PDF Border Cropper")
-        self.root.geometry("550x280")
+        self.root.geometry("580x440")  # Made slightly taller to comfortably fit the folder list
         self.root.resizable(False, False)
 
-        self.input_path = tk.StringVar()
+        # Variables
+        self.selection_mode = tk.StringVar(value="Folder")
+        self.selected_folders = []  # Holds list of Path objects for folders
+        self.selected_files = []    # Holds list of Path objects for files
         self.output_path = tk.StringVar()
         
-        # Queue for thread-safe communication
         self.gui_queue = queue.Queue()
 
         # --- GUI LAYOUT ---
-        # Input Section
-        lbl_in = tk.Label(root, text="Input Folder (Original PDFs):", font=("Arial", 10, "bold"))
-        lbl_in.pack(anchor="w", padx=20, pady=(15, 2))
+        
+        # 1. Selection Mode Toggles
+        lbl_mode = tk.Label(root, text="Selection Mode:", font=("Arial", 10, "bold"))
+        lbl_mode.pack(anchor="w", padx=20, pady=(15, 2))
+        
+        frame_mode = tk.Frame(root)
+        frame_mode.pack(fill="x", padx=20)
+        
+        rb_folder = tk.Radiobutton(frame_mode, text="Select Folder(s)", variable=self.selection_mode, value="Folder", command=self.update_ui_view)
+        rb_folder.pack(side="left", padx=(0, 20))
+        
+        rb_files = tk.Radiobutton(frame_mode, text="Select File(s)", variable=self.selection_mode, value="Files", command=self.update_ui_view)
+        rb_files.pack(side="left")
+
+        # 2. Dynamic Input Section (Listbox displaying chosen targets)
+        self.lbl_in = tk.Label(root, text="Target Folders to Process:", font=("Arial", 10, "bold"))
+        self.lbl_in.pack(anchor="w", padx=20, pady=(10, 2))
+        
         frame_in = tk.Frame(root)
         frame_in.pack(fill="x", padx=20)
-        self.entry_in = tk.Entry(frame_in, textvariable=self.input_path, width=50)
-        self.entry_in.pack(side="left", expand=True, fill="x", padx=(0, 5))
-        btn_in = tk.Button(frame_in, text="Browse...", command=self.select_input)
-        btn_in.pack(side="right")
+        
+        # Listbox to hold paths
+        self.listbox_in = tk.Listbox(frame_in, height=5, font=("Arial", 9))
+        self.listbox_in.pack(side="left", expand=True, fill="both", padx=(0, 5))
+        
+        # Scrollbar for listbox
+        scrollbar = ttk.Scrollbar(frame_in, orient="vertical", command=self.listbox_in.yview)
+        scrollbar.pack(side="left", fill="y", padx=(0, 5))
+        self.listbox_in.config(yscrollcommand=scrollbar.set)
+        
+        # Control Buttons on the right of the list box
+        frame_list_btns = tk.Frame(frame_in)
+        frame_list_btns.pack(side="right", fill="y")
+        
+        self.btn_add = tk.Button(frame_list_btns, text="Add...", width=10, command=self.add_input_target)
+        self.btn_add.pack(anchor="n", pady=(0, 5))
+        
+        self.btn_remove = tk.Button(frame_list_btns, text="Remove", width=10, command=self.remove_selected_target)
+        self.btn_remove.pack(anchor="n")
 
-        # Output Section
+        # 3. Output Section
         lbl_out = tk.Label(root, text="Output Folder (Cropped PDFs):", font=("Arial", 10, "bold"))
         lbl_out.pack(anchor="w", padx=20, pady=(15, 2))
         frame_out = tk.Frame(root)
@@ -65,24 +93,60 @@ class PDFCropSelector:
         btn_out = tk.Button(frame_out, text="Browse...", command=self.select_output)
         btn_out.pack(side="right")
 
-        # Start Button
+        # 4. Start Button
         self.btn_start = tk.Button(root, text="START PROCESSING", font=("Arial", 11, "bold"), bg="#4CAF50", fg="white", padx=10, pady=5, command=self.start_thread)
         self.btn_start.pack(pady=20)
 
-        # Status Label and Progress Bar
+        # 5. Status Label and Progress Bar
         self.lbl_status = tk.Label(root, text="Ready", font=("Arial", 9, "italic"))
         self.lbl_status.pack(anchor="w", padx=20)
         
-        self.progress_bar = ttk.Progressbar(root, orient="horizontal", length=510, mode="determinate")
+        self.progress_bar = ttk.Progressbar(root, orient="horizontal", length=540, mode="determinate")
         self.progress_bar.pack(padx=20, pady=(2, 15))
 
-        # Start monitoring the queue loop
         self.process_queue()
 
-    def select_input(self):
-        folder = filedialog.askdirectory(title="Select INPUT Folder")
-        if folder:
-            self.input_path.set(folder)
+    def update_ui_view(self):
+        """Switches the list labels when toggling between Files and Folders."""
+        self.listbox_in.delete(0, tk.END)
+        if self.selection_mode.get() == "Folder":
+            self.lbl_in.config(text="Target Folders to Process:")
+            for p in self.selected_folders:
+                self.listbox_in.insert(tk.END, str(p))
+        else:
+            self.lbl_in.config(text="Target PDF Files to Process:")
+            for p in self.selected_files:
+                self.listbox_in.insert(tk.END, p.name)
+
+    def add_input_target(self):
+        """Adds single/multiple items to our tracking lists dynamically."""
+        if self.selection_mode.get() == "Folder":
+            folder = filedialog.askdirectory(title="Select a Folder to Add")
+            if folder:
+                folder_path = Path(folder)
+                if folder_path not in self.selected_folders:
+                    self.selected_folders.append(folder_path)
+                    self.listbox_in.insert(tk.END, str(folder_path))
+        else:
+            files = filedialog.askopenfilenames(title="Select PDF File(s) to Add", filetypes=[("PDF Files", "*.pdf")])
+            if files:
+                for f in files:
+                    file_path = Path(f)
+                    if file_path not in self.selected_files:
+                        self.selected_files.append(file_path)
+                        self.listbox_in.insert(tk.END, file_path.name)
+
+    def remove_selected_target(self):
+        """Removes the highlighted item in the list box from our tracking arrays."""
+        try:
+            selected_index = self.listbox_in.curselection()[0]
+            if self.selection_mode.get() == "Folder":
+                del self.selected_folders[selected_index]
+            else:
+                del self.selected_files[selected_index]
+            self.listbox_in.delete(selected_index)
+        except IndexError:
+            messagebox.showwarning("Selection Error", "Please select an item from the list box to remove!")
 
     def select_output(self):
         folder = filedialog.askdirectory(title="Select OUTPUT Folder")
@@ -90,37 +154,42 @@ class PDFCropSelector:
             self.output_path.set(folder)
 
     def start_thread(self):
-        c_input = self.input_path.get()
         c_output = self.output_path.get()
+        active_sources = self.selected_folders if self.selection_mode.get() == "Folder" else self.selected_files
 
-        if not c_input or not c_output:
-            messagebox.showerror("Error", "Please select both input and output folders!")
+        if not active_sources or not c_output:
+            messagebox.showerror("Error", "Please add at least one input target and pick an output folder!")
             return
-        if Path(c_input).resolve() == Path(c_output).resolve():
-            messagebox.showerror("Error", "Output folder must be different from the input folder!")
-            return
+
+        out_resolved = Path(c_output).resolve()
+        for source in active_sources:
+            if source.resolve() == out_resolved:
+                messagebox.showerror("Error", "The output folder cannot match any selected input paths!")
+                return
 
         self.btn_start.config(state="disabled")
-        threading.Thread(target=self.process_pdfs, args=(c_input, c_output), daemon=True).start()
+        threading.Thread(target=self.process_pdfs, args=(c_output,), daemon=True).start()
 
-    def process_pdfs(self, input_dir, output_dir):
-        """Runs in background thread. Communicates via self.gui_queue."""
-        input_path = Path(input_dir)
+    def process_pdfs(self, output_dir):
         output_path = Path(output_dir)
+        pdf_files = []
         
-        pdf_files = list(input_path.glob("*.pdf"))
+        if self.selection_mode.get() == "Folder":
+            for folder_path in self.selected_folders:
+                pdf_files.extend(list(folder_path.glob("*.pdf")))
+        else:
+            pdf_files = self.selected_files
+            
         total_files = len(pdf_files)
 
         if total_files == 0:
-            self.gui_queue.put(("warning", ("Warning", "No PDF files found in the input folder.")))
+            self.gui_queue.put(("warning", ("Warning", "No PDF files found inside your selected targets.")))
             return
 
-        # Setup progress bar maximum
         self.gui_queue.put(("setup_progress", total_files))
         success_count = 0
 
         for i, pdf_file in enumerate(pdf_files):
-            # Safe cross-thread GUI update command
             self.gui_queue.put(("update_status", f"Processing: {pdf_file.name} ({i+1}/{total_files})"))
             
             try:
@@ -130,7 +199,6 @@ class PDFCropSelector:
                     if new_box:
                         page.set_cropbox(new_box)
                 
-                # Check for filename collisions and save safely
                 target_file = output_path / pdf_file.name
                 if target_file.exists():
                     target_file = output_path / f"cropped_{pdf_file.name}"
@@ -141,18 +209,14 @@ class PDFCropSelector:
             except Exception as e:
                 print(f"Error encountered on file {pdf_file.name}: {e}")
 
-            # Update progress bar safely
             self.gui_queue.put(("progress", i + 1))
 
-        # Signal completion
         self.gui_queue.put(("complete", (success_count, total_files)))
 
     def process_queue(self):
-        """Runs continuously on the MAIN thread to safely digest GUI updates."""
         try:
             while True:
                 msg_type, data = self.gui_queue.get_nowait()
-                
                 if msg_type == "setup_progress":
                     self.progress_bar["maximum"] = data
                     self.progress_bar["value"] = 0
@@ -168,12 +232,10 @@ class PDFCropSelector:
                     self.btn_start.config(state="normal")
                     self.lbl_status.config(text="Processing completed!")
                     messagebox.showinfo("Completed", f"Process finished!\nFiles successfully saved: {success}/{total}")
-                
                 self.gui_queue.task_done()
         except queue.Empty:
             pass
         finally:
-            # Check the queue again in 100 milliseconds
             self.root.after(100, self.process_queue)
 
 
