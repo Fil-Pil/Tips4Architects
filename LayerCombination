@@ -5,91 +5,88 @@ from tkinter import Tk, filedialog, messagebox, ttk
 
 
 def parse_archicad_xml(xml_path):
-    """Parses the Archicad XML file to extract the Layers/Combinations matrix."""
+    """Parses the Archicad XML file using a structurally flexible approach."""
     try:
         tree = ET.parse(xml_path)
         root = tree.getroot()
     except Exception as e:
         raise ValueError(f"Error parsing XML file: {e}")
 
-    # Helper dictionaries
     layers_by_guid = {}  # guid -> Layer Name
     all_layers = set()
     combinations = {}    # ComboName -> { LayerName: "Present"/"Not Present" }
 
-    # STEP 1: Find all Layers (Attributes Type="Lucidi")
-    for attr_group in root.findall(".//Attributes[@Type='Lucidi']"):
-        for layer_node in attr_group.findall("Layer"):
-            # Extract layer name
+    # 1. STEP: Extract all Layers (Look inside any Attributes block, flexible check)
+    # Usually under <Attributes Type="Lucidi"> or similar, but we search for the <Layer> tags directly.
+    for layer_node in root.findall(".//Layer"):
+        # We ensure it's a definition layer (has an Index and Name, but NOT inside a combination status)
+        if layer_node.get("Idx") is not None and layer_node.find("Name") is not None:
             layer_name = layer_node.findtext("Name")
             if not layer_name:
                 continue
             
-            # Extract unique layer GUID
             guid_node = layer_node.find(".//OdbRef/guid")
             guid = guid_node.text if guid_node is not None else None
             
+            # Check default layer status from flags
+            flags_text = layer_node.findtext("Flags") or ""
+            is_default_hidden = "Layer_Hidden" in flags_text
+            
             all_layers.add(layer_name)
             if guid:
-                layers_by_guid[guid] = layer_name
+                layers_by_guid[guid] = {
+                    "name": layer_name,
+                    "default_status": "Not Present" if is_default_hidden else "Present"
+                }
 
-    # STEP 2: Find Layer Combinations
-    # Flexible search for the combinations block (e.g., "Combinazioni Lucidi" or similar)
-    combo_groups = [g for g in root.findall(".//Attributes") if g.get("Type") and "Combinazion" in g.get("Type")]
-    
-    # Fallback if specific group is not found
-    if not combo_groups:
-        combo_nodes = root.findall(".//LayerCombination") or root.findall(".//LayerAttrCombination")
-    else:
-        combo_nodes = []
-        for group in combo_groups:
-            combo_nodes.extend(group.findall("LayerCombination") or group.findall("Combination") or group.findall(".//Item"))
-
-    # Process found combinations
-    for combo_node in combo_nodes:
-        combo_name = combo_node.findtext("Name") or combo_node.get("Name")
+    # 2. STEP: Extract Layer Combinations (Search globally for <LayerCombination>)
+    for combo_node in root.findall(".//LayerCombination"):
+        combo_name = combo_node.findtext("Name")
         if not combo_name:
             continue
-            
+        
         combinations[combo_name] = {}
         
-        # Map layers inside this combination
-        for layer_ref in combo_node.findall(".//Layer") or combo_node.findall(".//LayerStatus") or combo_node.findall(".//LayerRef"):
-            ref_guid_node = layer_ref.find(".//guid") or layer_ref.find(".//OdbRef/guid")
-            ref_guid = ref_guid_node.text if ref_guid_node is not None else layer_ref.get("guid")
+        # Inside LayerCombination, Archicad stores statuses inside <LayerStatus> blocks
+        for layer_status_node in combo_node.findall(".//LayerStatus"):
+            # Find the layer GUID reference
+            layer_ref_guid_node = layer_status_node.find(".//Layer/OdbRef/guid")
+            if layer_ref_guid_node is None:
+                continue
             
-            # Check visibility status
-            status_text = layer_ref.findtext("Status") or layer_ref.get("Status") or ""
-            is_hidden = "Hidden" in status_text or "0" == status_text or layer_ref.find("Flags") is not None and "Hidden" in (layer_ref.findtext("Flags") or "")
+            ref_guid = layer_ref_guid_node.text
             
-            if ref_guid and ref_guid in layers_by_guid:
-                l_name = layers_by_guid[ref_guid]
-                combinations[combo_name][l_name] = "Not Present" if is_hidden else "Present"
-            elif layer_ref.findtext("Name") or layer_ref.get("Name"):
-                l_name = layer_ref.findtext("Name") or layer_ref.get("Name")
+            # Check the status node (it usually contains visibility flags/numbers)
+            status_node = layer_status_node.find("Status")
+            status_text = status_node.text if status_node is not None else ""
+            
+            # In Archicad XML, if a layer is hidden in a combo, it contains 'Hidden' or specific bitmasks
+            is_hidden = (
+                "Hidden" in status_text or 
+                status_text == "0" or 
+                ("0x" in status_text and status_text.endswith("0"))
+            )
+            
+            if ref_guid in layers_by_guid:
+                l_name = layers_by_guid[ref_guid]["name"]
                 combinations[combo_name][l_name] = "Not Present" if is_hidden else "Present"
 
-    # Fallback if no combinations were structured
-    if not combinations:
-        # Create a dummy "XML Default Status" combination based on Layer Flags
-        combinations["XML Default Status"] = {}
-        for attr_group in root.findall(".//Attributes[@Type='Lucidi']"):
-            for layer_node in attr_group.findall("Layer"):
-                layer_name = layer_node.findtext("Name")
-                flags = layer_node.findtext("Flags") or ""
-                combinations["XML Default Status"][layer_name] = "Not Present" if "Layer_Hidden" in flags else "Present"
-
-    return sorted(list(all_layers)), combinations
+    return sorted(list(all_layers)), combinations, layers_by_guid
 
 
 def generate_matrix(xml_path, csv_path):
     """Generates the cross-tabulated matrix and saves it as a CSV file."""
-    sorted_layers, combinations = parse_archicad_xml(xml_path)
+    sorted_layers, combinations, layers_by_guid = parse_archicad_xml(xml_path)
 
     if not sorted_layers:
         raise ValueError("Could not find any layers in the XML file. Please check the structure.")
 
     sorted_combos = sorted(list(combinations.keys()))
+    
+    # CRITICAL CHECK: If no combinations were extracted, raise an informative error
+    if not sorted_combos:
+        raise ValueError("No layer combinations found in the XML. Make sure to export BOTH layers and combinations from Archicad.")
+
     header = ["Layers / Combinations"] + sorted_combos
 
     with open(csv_path, mode="w", newline="", encoding="utf-8-sig") as f:
@@ -98,10 +95,17 @@ def generate_matrix(xml_path, csv_path):
 
         for layer in sorted_layers:
             row = [layer]
+            
+            # Find global default fallback for this layer
+            fallback = "Present"
+            for g_info in layers_by_guid.values():
+                if g_info["name"] == layer:
+                    fallback = g_info["default_status"]
+                    break
+
             for combo in sorted_combos:
-                status = combinations[combo].get(layer)
-                if status is None:
-                    status = combinations.get("XML Default Status", {}).get(layer, "Not Present")
+                # Get status from combo, if missing, use the layer's default fallback status
+                status = combinations[combo].get(layer, fallback)
                 row.append(status)
             writer.writerow(row)
 
