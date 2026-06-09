@@ -1,0 +1,168 @@
+import csv
+import os
+import xml.etree.ElementTree as ET
+from tkinter import Tk, filedialog, messagebox, ttk
+
+
+def parse_archicad_xml(xml_path):
+    """Parses the Archicad XML file to extract the Layers/Combinations matrix."""
+    try:
+        tree = ET.parse(xml_path)
+        root = tree.getroot()
+    except Exception as e:
+        raise ValueError(f"Error parsing XML file: {e}")
+
+    # Helper dictionaries
+    layers_by_guid = {}  # guid -> Layer Name
+    all_layers = set()
+    combinations = {}    # ComboName -> { LayerName: "Present"/"Not Present" }
+
+    # STEP 1: Find all Layers (Attributes Type="Lucidi")
+    for attr_group in root.findall(".//Attributes[@Type='Lucidi']"):
+        for layer_node in attr_group.findall("Layer"):
+            # Extract layer name
+            layer_name = layer_node.findtext("Name")
+            if not layer_name:
+                continue
+            
+            # Extract unique layer GUID
+            guid_node = layer_node.find(".//OdbRef/guid")
+            guid = guid_node.text if guid_node is not None else None
+            
+            all_layers.add(layer_name)
+            if guid:
+                layers_by_guid[guid] = layer_name
+
+    # STEP 2: Find Layer Combinations
+    # Flexible search for the combinations block (e.g., "Combinazioni Lucidi" or similar)
+    combo_groups = [g for g in root.findall(".//Attributes") if g.get("Type") and "Combinazion" in g.get("Type")]
+    
+    # Fallback if specific group is not found
+    if not combo_groups:
+        combo_nodes = root.findall(".//LayerCombination") or root.findall(".//LayerAttrCombination")
+    else:
+        combo_nodes = []
+        for group in combo_groups:
+            combo_nodes.extend(group.findall("LayerCombination") or group.findall("Combination") or group.findall(".//Item"))
+
+    # Process found combinations
+    for combo_node in combo_nodes:
+        combo_name = combo_node.findtext("Name") or combo_node.get("Name")
+        if not combo_name:
+            continue
+            
+        combinations[combo_name] = {}
+        
+        # Map layers inside this combination
+        for layer_ref in combo_node.findall(".//Layer") or combo_node.findall(".//LayerStatus") or combo_node.findall(".//LayerRef"):
+            ref_guid_node = layer_ref.find(".//guid") or layer_ref.find(".//OdbRef/guid")
+            ref_guid = ref_guid_node.text if ref_guid_node is not None else layer_ref.get("guid")
+            
+            # Check visibility status
+            status_text = layer_ref.findtext("Status") or layer_ref.get("Status") or ""
+            is_hidden = "Hidden" in status_text or "0" == status_text or layer_ref.find("Flags") is not None and "Hidden" in (layer_ref.findtext("Flags") or "")
+            
+            if ref_guid and ref_guid in layers_by_guid:
+                l_name = layers_by_guid[ref_guid]
+                combinations[combo_name][l_name] = "Not Present" if is_hidden else "Present"
+            elif layer_ref.findtext("Name") or layer_ref.get("Name"):
+                l_name = layer_ref.findtext("Name") or layer_ref.get("Name")
+                combinations[combo_name][l_name] = "Not Present" if is_hidden else "Present"
+
+    # Fallback if no combinations were structured
+    if not combinations:
+        # Create a dummy "XML Default Status" combination based on Layer Flags
+        combinations["XML Default Status"] = {}
+        for attr_group in root.findall(".//Attributes[@Type='Lucidi']"):
+            for layer_node in attr_group.findall("Layer"):
+                layer_name = layer_node.findtext("Name")
+                flags = layer_node.findtext("Flags") or ""
+                combinations["XML Default Status"][layer_name] = "Not Present" if "Layer_Hidden" in flags else "Present"
+
+    return sorted(list(all_layers)), combinations
+
+
+def generate_matrix(xml_path, csv_path):
+    """Generates the cross-tabulated matrix and saves it as a CSV file."""
+    sorted_layers, combinations = parse_archicad_xml(xml_path)
+
+    if not sorted_layers:
+        raise ValueError("Could not find any layers in the XML file. Please check the structure.")
+
+    sorted_combos = sorted(list(combinations.keys()))
+    header = ["Layers / Combinations"] + sorted_combos
+
+    with open(csv_path, mode="w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow(header)
+
+        for layer in sorted_layers:
+            row = [layer]
+            for combo in sorted_combos:
+                status = combinations[combo].get(layer)
+                if status is None:
+                    status = combinations.get("XML Default Status", {}).get(layer, "Not Present")
+                row.append(status)
+            writer.writerow(row)
+
+
+class ArchicadConverterApp:
+    """Tkinter Graphical User Interface."""
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Archicad XML to CSV Converter")
+        self.root.geometry("500x200")
+        self.root.resizable(False, False)
+
+        self.xml_file = ""
+
+        frame = ttk.Frame(root, padding="20")
+        frame.pack(fill="both", expand=True)
+
+        self.lbl_info = ttk.Label(
+            frame,
+            text="Select the XML file exported from Archicad to generate the Layer/Combination matrix.",
+            wraplength=450,
+        )
+        self.lbl_info.pack(pady=10)
+
+        self.btn_select = ttk.Button(
+            frame, text="Select XML File", command=self.select_file
+        )
+        self.btn_select.pack(pady=10)
+
+        self.lbl_status = ttk.Label(
+            frame, text="No file selected", foreground="gray"
+        )
+        self.lbl_status.pack(pady=5)
+
+    def select_file(self):
+        self.xml_file = filedialog.askopenfilename(
+            title="Open Archicad XML", filetypes=[("XML Files", "*.xml")]
+        )
+
+        if self.xml_file:
+            self.lbl_status.config(text=os.path.basename(self.xml_file), foreground="black")
+            csv_file = filedialog.asksaveasfilename(
+                title="Save CSV as...",
+                defaultextension=".csv",
+                filetypes=[("CSV Files", "*.csv")],
+                initialfile="Archicad_Layer_Matrix.csv",
+            )
+
+            if csv_file:
+                try:
+                    generate_matrix(self.xml_file, csv_file)
+                    messagebox.showinfo("Success", "CSV file generated successfully!")
+                except Exception as e:
+                    messagebox.showerror("Error", f"An error occurred:\n{str(e)}")
+            else:
+                self.lbl_status.config(text="Saving cancelled", foreground="orange")
+        else:
+            self.lbl_status.config(text="No file selected", foreground="gray")
+
+
+if __name__ == "__main__":
+    root = Tk()
+    app = ArchicadConverterApp(root)
+    root.mainloop()
